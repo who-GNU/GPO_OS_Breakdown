@@ -1,0 +1,154 @@
+Can you review this code?
+
+#Requires -Modules ActiveDirectory, GroupPolicy
+
+<#
+.SYNOPSIS
+    Analyzes GPOs and their linked locations for computer objects and Windows versions
+.DESCRIPTION
+    This script checks all GPOs in a domain, finds where they're linked, 
+    identifies computer objects in those locations, and analyzes Windows versions
+.NOTES
+    Requires Active Directory and Group Policy PowerShell modules
+#>
+
+# Import required modules
+Import-Module ActiveDirectory -ErrorAction Stop
+Import-Module GroupPolicy -ErrorAction Stop
+
+# Initialize collections to store results
+$Results = @()
+$GPOAnalysis = @()
+
+Write-Host "Starting GPO and Computer Analysis..." -ForegroundColor Green
+Write-Host "=" * 50
+
+try {
+    # Step 1: Get all GPOs in the domain
+    Write-Host "Step 1: Retrieving all GPOs in domain..." -ForegroundColor Yellow
+    $AllGPOs = Get-GPO -All
+    Write-Host "Found $($AllGPOs.Count) GPOs in domain" -ForegroundColor Cyan
+    
+    foreach ($GPO in $AllGPOs) {
+        Write-Host "Processing GPO: $($GPO.DisplayName)" -ForegroundColor White
+        
+        # Step 2: Get GPO links (where the GPO is linked)
+        Write-Host "  - Finding link locations..." -ForegroundColor Gray
+        
+        # Get GPO report to find link information
+        [xml]$GPOReport = Get-GPOReport -Guid $GPO.Id -ReportType Xml
+        
+        # Extract link information from the GPO report
+        $Links = $GPOReport.GPO.LinksTo
+        
+        if ($Links) {
+            foreach ($Link in $Links) {
+                $LinkPath = $Link.SOMPath
+                Write-Host "    - Linked to: $LinkPath" -ForegroundColor Gray
+                
+                # Step 3: Get computer objects in the linked location
+                Write-Host "    - Searching for computer objects..." -ForegroundColor Gray
+                
+                try {
+                    # Get computers in the OU/Domain where GPO is linked
+                    $Computers = Get-ADComputer -Filter * -SearchBase $LinkPath -Properties Name, OperatingSystem, OperatingSystemVersion, LastLogonDate
+                    
+                    Write-Host "      Found $($Computers.Count) computer objects" -ForegroundColor Cyan
+                    
+                    # Step 4: Analyze Windows versions for computers in this link location
+                    $WindowsVersions = @{}
+                    $ComputerDetails = @()
+                    
+                    foreach ($Computer in $Computers) {
+                        $OS = $Computer.OperatingSystem
+                        $OSVersion = $Computer.OperatingSystemVersion
+                        
+                        # Create a standardized OS identifier
+                        $OSIdentifier = if ($OS) { $OS } else { "Unknown" }
+                        
+                        # Count versions
+                        if ($WindowsVersions.ContainsKey($OSIdentifier)) {
+                            $WindowsVersions[$OSIdentifier]++
+                        } else {
+                            $WindowsVersions[$OSIdentifier] = 1
+                        }
+                        
+                        # Store detailed computer info
+                        $ComputerDetails += [PSCustomObject]@{
+                            ComputerName = $Computer.Name
+                            OperatingSystem = $OS
+                            OperatingSystemVersion = $OSVersion
+                            LastLogon = $Computer.LastLogonDate
+                        }
+                    }
+                    
+                    # Determine if all computers have the same Windows version
+                    $UniqueVersions = $WindowsVersions.Keys.Count
+                    $AllSameVersion = $UniqueVersions -eq 1
+                    $MostCommonVersion = ($WindowsVersions.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 1).Name
+                    
+                    # Store results for this GPO link
+                    $GPOLinkResult = [PSCustomObject]@{
+                        GPOName = $GPO.DisplayName
+                        GPOId = $GPO.Id
+                        LinkLocation = $LinkPath
+                        ComputerCount = $Computers.Count
+                        AllSameVersion = $AllSameVersion
+                        UniqueVersionCount = $UniqueVersions
+                        MostCommonVersion = $MostCommonVersion
+                        VersionBreakdown = $WindowsVersions
+                        ComputerDetails = $ComputerDetails
+                        AnalysisDate = Get-Date
+                    }
+                    
+                    $Results += $GPOLinkResult
+                    
+                    # Display summary for this link
+                    Write-Host "      Analysis Summary:" -ForegroundColor Yellow
+                    Write-Host "        - All same version: $AllSameVersion" -ForegroundColor $(if ($AllSameVersion) { "Green" } else { "Red" })
+                    Write-Host "        - Most common version: $MostCommonVersion" -ForegroundColor Cyan
+                    Write-Host "        - Unique versions: $UniqueVersions" -ForegroundColor White
+                    
+                    if ($UniqueVersions -gt 1) {
+                        Write-Host "        - Version breakdown:" -ForegroundColor White
+                        foreach ($Version in $WindowsVersions.GetEnumerator()) {
+                            Write-Host "          * $($Version.Key): $($Version.Value) computers" -ForegroundColor Gray
+                        }
+                    }
+                    
+                } catch {
+                    Write-Warning "Failed to process computers in $LinkPath`: $($_.Exception.Message)"
+                }
+            }
+        } else {
+            Write-Host "    - No links found for this GPO" -ForegroundColor Yellow
+        }
+        
+        Write-Host "" # Add spacing between GPOs
+    }
+    
+    # Summary Report
+    Write-Host "=" * 50
+    Write-Host "ANALYSIS COMPLETE - SUMMARY REPORT" -ForegroundColor Green
+    Write-Host "=" * 50
+    
+    $TotalGPOLinks = $Results.Count
+    $LinksWithSameVersion = ($Results | Where-Object { $_.AllSameVersion }).Count
+    $LinksWithMixedVersions = $TotalGPOLinks - $LinksWithSameVersion
+    $TotalComputers = ($Results | Measure-Object -Property ComputerCount -Sum).Sum
+    
+    Write-Host "Total GPO Links Analyzed: $TotalGPOLinks" -ForegroundColor White
+    Write-Host "Total Computers Found: $TotalComputers" -ForegroundColor White
+    Write-Host "Links with Uniform Windows Versions: $LinksWithSameVersion" -ForegroundColor Green
+    Write-Host "Links with Mixed Windows Versions: $LinksWithMixedVersions" -ForegroundColor $(if ($LinksWithMixedVersions -gt 0) { "Red" } else { "Green" })
+    
+    # Store results in global variable for further processing
+    $Global:GPOAnalysisResults = $Results
+    
+    Write-Host "`nResults stored in `$Global:GPOAnalysisResults variable" -ForegroundColor Yellow
+    Write-Host "Ready for additional steps..." -ForegroundColor Green
+
+} catch {
+    Write-Error "Script execution failed: $($_.Exception.Message)"
+    Write-Error "Stack Trace: $($_.ScriptStackTrace)"
+}
