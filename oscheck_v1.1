@@ -1,0 +1,359 @@
+#Requires -Modules ActiveDirectory, GroupPolicy
+
+<#
+.SYNOPSIS
+    Analyzes GPOs linked to a specific OU and its sub-OUs for computer objects and Windows versions
+.DESCRIPTION
+    This script checks a specific OU and all its sub-OUs, finds GPOs linked to them,
+    identifies computer objects in those locations, and analyzes Windows versions.
+    Outputs results to Excel spreadsheet with multiple worksheets.
+.PARAMETER TargetOU
+    The Distinguished Name of the target OU to analyze
+.PARAMETER OutputPath
+    Path where the Excel file should be saved (optional - defaults to current directory)
+.PARAMETER OutputFileName
+    Name of the output file without extension (optional - defaults to timestamp-based name)
+.NOTES
+    Requires Active Directory and Group Policy PowerShell modules
+    Optionally uses ImportExcel module for better Excel output, falls back to CSV if not available
+#>
+
+param(
+    [Parameter(Mandatory=$true)]
+    [string]$TargetOU,
+    
+    [Parameter(Mandatory=$false)]
+    [string]$OutputPath = (Get-Location).Path,
+    
+    [Parameter(Mandatory=$false)]
+    [string]$OutputFileName = "OU-GPO-Analysis_$(Get-Date -Format 'yyyy-MM-dd_HH-mm-ss')"
+)
+
+# Import required modules
+Import-Module ActiveDirectory -ErrorAction Stop
+Import-Module GroupPolicy -ErrorAction Stop
+
+# Check if ImportExcel module is available for better Excel output
+$UseExcel = $false
+try {
+    Import-Module ImportExcel -ErrorAction Stop
+    $UseExcel = $true
+    Write-Host "ImportExcel module found - will create Excel output" -ForegroundColor Green
+} catch {
+    Write-Host "ImportExcel module not found - will create CSV output" -ForegroundColor Yellow
+    Write-Host "To install: Install-Module ImportExcel -Scope CurrentUser" -ForegroundColor Gray
+}
+
+# Initialize collections to store results
+$Results = @()
+$OUAnalysis = @()
+$ComputerDetails = @()
+$GPODetails = @()
+$SummaryData = @()
+
+Write-Host "Starting OU-focused GPO and Computer Analysis..." -ForegroundColor Green
+Write-Host "Target OU: $TargetOU" -ForegroundColor Cyan
+Write-Host "=" * 50
+
+try {
+    # Step 1: Validate and get the target OU and all its sub-OUs
+    Write-Host "Step 1: Retrieving target OU and all sub-OUs..." -ForegroundColor Yellow
+    
+    # Verify the target OU exists
+    try {
+        $BaseOU = Get-ADOrganizationalUnit -Identity $TargetOU
+        Write-Host "Base OU found: $($BaseOU.Name)" -ForegroundColor Green
+    } catch {
+        throw "Target OU '$TargetOU' not found or inaccessible: $($_.Exception.Message)"
+    }
+    
+    # Get all OUs under the target OU (including the target OU itself)
+    $AllOUs = @($BaseOU) + @(Get-ADOrganizationalUnit -Filter * -SearchBase $TargetOU -SearchScope Subtree)
+    Write-Host "Found $($AllOUs.Count) OUs to analyze (including base OU)" -ForegroundColor Cyan
+    
+    foreach ($OU in $AllOUs) {
+        Write-Host "Processing OU: $($OU.Name)" -ForegroundColor White
+        Write-Host "  DN: $($OU.DistinguishedName)" -ForegroundColor Gray
+        
+        # Step 2: Find GPOs linked to this OU
+        Write-Host "  - Finding linked GPOs..." -ForegroundColor Gray
+        
+        try {
+            # Get GPO links for this specific OU
+            $GPOLinks = Get-GPInheritance -Target $OU.DistinguishedName
+            
+            if ($GPOLinks.GpoLinks) {
+                Write-Host "    Found $($GPOLinks.GpoLinks.Count) linked GPOs" -ForegroundColor Cyan
+                
+                # Step 3: Get computer objects in this OU (not recursive - just this OU level)
+                Write-Host "  - Searching for computer objects in this OU..." -ForegroundColor Gray
+                
+                $Computers = Get-ADComputer -Filter * -SearchBase $OU.DistinguishedName -SearchScope OneLevel -Properties Name, OperatingSystem, OperatingSystemVersion, LastLogonDate
+                Write-Host "    Found $($Computers.Count) computer objects in this OU" -ForegroundColor Cyan
+                
+                if ($Computers.Count -gt 0) {
+                    # Step 4: Analyze Windows versions for computers in this OU
+                    $WindowsVersions = @{}
+                    $ComputerDetails = @()
+                    
+                    foreach ($Computer in $Computers) {
+                        $OS = $Computer.OperatingSystem
+                        $OSVersion = $Computer.OperatingSystemVersion
+                        
+                        # Create a standardized OS identifier
+                        $OSIdentifier = if ($OS) { $OS } else { "Unknown" }
+                        
+                        # Count versions
+                        if ($WindowsVersions.ContainsKey($OSIdentifier)) {
+                            $WindowsVersions[$OSIdentifier]++
+                        } else {
+                            $WindowsVersions[$OSIdentifier] = 1
+                        }
+                        
+                        # Store detailed computer info (for separate worksheet)
+                        $ComputerDetails += [PSCustomObject]@{
+                            OUName = $OU.Name
+                            OUDN = $OU.DistinguishedName
+                            ComputerName = $Computer.Name
+                            OperatingSystem = $OS
+                            OperatingSystemVersion = $OSVersion
+                            LastLogon = $Computer.LastLogonDate
+                            AnalysisDate = Get-Date
+                        }
+                    }
+                    
+                    # Determine if all computers have the same Windows version
+                    $UniqueVersions = $WindowsVersions.Keys.Count
+                    $AllSameVersion = $UniqueVersions -eq 1
+                    $MostCommonVersion = if ($WindowsVersions.Count -gt 0) { 
+                        ($WindowsVersions.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 1).Name 
+                    } else { "N/A" }
+                    
+                    # Get GPO details for this OU (for separate worksheet)
+                    foreach ($GPOLink in $GPOLinks.GpoLinks) {
+                        $GPODetails += [PSCustomObject]@{
+                            OUName = $OU.Name
+                            OUDN = $OU.DistinguishedName
+                            GPOName = $GPOLink.DisplayName
+                            GPOId = $GPOLink.GpoId
+                            Enabled = $GPOLink.Enabled
+                            Enforced = $GPOLink.Enforced
+                            Order = $GPOLink.Order
+                            AnalysisDate = Get-Date
+                        }
+                    }
+                    
+                    # Store results for this OU (main summary worksheet)
+                    $OUResult = [PSCustomObject]@{
+                        OUName = $OU.Name
+                        OUDistinguishedName = $OU.DistinguishedName
+                        GPOCount = $GPOLinks.GpoLinks.Count
+                        ComputerCount = $Computers.Count
+                        AllSameVersion = $AllSameVersion
+                        UniqueVersionCount = $UniqueVersions
+                        MostCommonVersion = $MostCommonVersion
+                        'Windows_10_Count' = if ($WindowsVersions.'Windows 10') { $WindowsVersions.'Windows 10' } else { 0 }
+                        'Windows_11_Count' = if ($WindowsVersions.'Windows 11') { $WindowsVersions.'Windows 11' } else { 0 }
+                        'Windows_Server_Count' = ($WindowsVersions.GetEnumerator() | Where-Object { $_.Key -like "*Server*" } | Measure-Object -Property Value -Sum).Sum
+                        'Other_OS_Count' = ($WindowsVersions.GetEnumerator() | Where-Object { $_.Key -notlike "*Windows 10*" -and $_.Key -notlike "*Windows 11*" -and $_.Key -notlike "*Server*" } | Measure-Object -Property Value -Sum).Sum
+                        VersionBreakdownText = ($WindowsVersions.GetEnumerator() | ForEach-Object { "$($_.Key): $($_.Value)" }) -join "; "
+                        AnalysisDate = Get-Date
+                    }
+                    
+                    $Results += $OUResult
+                    
+                    # Display summary for this OU
+                    Write-Host "    Analysis Summary:" -ForegroundColor Yellow
+                    Write-Host "      - All same version: $AllSameVersion" -ForegroundColor $(if ($AllSameVersion) { "Green" } else { "Red" })
+                    Write-Host "      - Most common version: $MostCommonVersion" -ForegroundColor Cyan
+                    Write-Host "      - Unique versions: $UniqueVersions" -ForegroundColor White
+                    Write-Host "      - Linked GPOs: $($GPOLinks.GpoLinks.Count)" -ForegroundColor White
+                    
+                    if ($UniqueVersions -gt 1) {
+                        Write-Host "      - Version breakdown:" -ForegroundColor White
+                        foreach ($Version in $WindowsVersions.GetEnumerator()) {
+                            Write-Host "        * $($Version.Key): $($Version.Value) computers" -ForegroundColor Gray
+                        }
+                    }
+                    
+                    # Show linked GPOs
+                    if ($GPOLinks.GpoLinks.Count -gt 0) {
+                        Write-Host "      - Linked GPOs:" -ForegroundColor White
+                        foreach ($LinkedGPO in $GPOLinks.GpoLinks) {
+                            $status = if ($LinkedGPO.Enabled) { "Enabled" } else { "Disabled" }
+                            $enforced = if ($LinkedGPO.Enforced) { " (Enforced)" } else { "" }
+                            Write-Host "        * $($LinkedGPO.DisplayName) - $status$enforced" -ForegroundColor Gray
+                        }
+                    }
+                } else {
+                    Write-Host "    No computers found in this OU" -ForegroundColor Yellow
+                }
+                
+            } else {
+                Write-Host "    No GPOs linked to this OU" -ForegroundColor Yellow
+            }
+            
+        } catch {
+            Write-Warning "Failed to process OU '$($OU.DistinguishedName)': $($_.Exception.Message)"
+        }
+        
+        Write-Host "" # Add spacing between OUs
+    }
+    
+    # Summary Report
+    Write-Host "=" * 50
+    Write-Host "OU ANALYSIS COMPLETE - SUMMARY REPORT" -ForegroundColor Green
+    Write-Host "=" * 50
+    
+    $TotalOUsAnalyzed = $Results.Count
+    $OUsWithComputers = ($Results | Where-Object { $_.ComputerCount -gt 0 }).Count
+    $OUsWithSameVersion = ($Results | Where-Object { $_.AllSameVersion -and $_.ComputerCount -gt 0 }).Count
+    $OUsWithMixedVersions = ($Results | Where-Object { -not $_.AllSameVersion -and $_.ComputerCount -gt 0 }).Count
+    $TotalComputers = ($Results | Measure-Object -Property ComputerCount -Sum).Sum
+    $TotalGPOLinks = ($Results | Measure-Object -Property GPOCount -Sum).Sum
+    
+    Write-Host "Target OU: $TargetOU" -ForegroundColor White
+    Write-Host "Total OUs Analyzed: $($AllOUs.Count)" -ForegroundColor White
+    Write-Host "OUs with Computers: $OUsWithComputers" -ForegroundColor White
+    Write-Host "Total Computers Found: $TotalComputers" -ForegroundColor White
+    Write-Host "Total GPO Links: $TotalGPOLinks" -ForegroundColor White
+    Write-Host "OUs with Uniform Windows Versions: $OUsWithSameVersion" -ForegroundColor Green
+    Write-Host "OUs with Mixed Windows Versions: $OUsWithMixedVersions" -ForegroundColor $(if ($OUsWithMixedVersions -gt 0) { "Red" } else { "Green" })
+    
+    # Show overall Windows version distribution
+    if ($TotalComputers -gt 0) {
+        Write-Host "`nOverall Windows Version Distribution:" -ForegroundColor Yellow
+        $AllVersions = @{}
+        foreach ($Result in $Results) {
+            foreach ($Version in $Result.VersionBreakdown.GetEnumerator()) {
+                if ($AllVersions.ContainsKey($Version.Key)) {
+                    $AllVersions[$Version.Key] += $Version.Value
+                } else {
+                    $AllVersions[$Version.Key] = $Version.Value
+                }
+            }
+        }
+        
+    # Create summary statistics for overview worksheet
+    foreach ($Version in $AllVersions.GetEnumerator() | Sort-Object Value -Descending) {
+        $Percentage = if ($TotalComputers -gt 0) { [math]::Round(($Version.Value / $TotalComputers) * 100, 1) } else { 0 }
+        $SummaryData += [PSCustomObject]@{
+            WindowsVersion = $Version.Key
+            ComputerCount = $Version.Value
+            Percentage = $Percentage
+            AnalysisDate = Get-Date
+        }
+    }
+    
+    # Export results to spreadsheet
+    Write-Host "`nExporting results to spreadsheet..." -ForegroundColor Yellow
+    
+    $OutputFile = if ($UseExcel) { 
+        Join-Path $OutputPath "$OutputFileName.xlsx" 
+    } else { 
+        $OutputPath
+    }
+    
+    try {
+        if ($UseExcel) {
+            # Create Excel file with multiple worksheets
+            Write-Host "Creating Excel file: $OutputFile" -ForegroundColor Cyan
+            
+            # Remove existing file if it exists
+            if (Test-Path $OutputFile) {
+                Remove-Item $OutputFile -Force
+            }
+            
+            # Export main OU summary
+            $Results | Export-Excel -Path $OutputFile -WorksheetName "OU Summary" -AutoSize -BoldTopRow -FreezeTopRow
+            
+            # Export computer details
+            if ($ComputerDetails.Count -gt 0) {
+                $ComputerDetails | Export-Excel -Path $OutputFile -WorksheetName "Computer Details" -AutoSize -BoldTopRow -FreezeTopRow
+            }
+            
+            # Export GPO details
+            if ($GPODetails.Count -gt 0) {
+                $GPODetails | Export-Excel -Path $OutputFile -WorksheetName "GPO Links" -AutoSize -BoldTopRow -FreezeTopRow
+            }
+            
+            # Export version summary
+            if ($SummaryData.Count -gt 0) {
+                $SummaryData | Export-Excel -Path $OutputFile -WorksheetName "Version Summary" -AutoSize -BoldTopRow -FreezeTopRow
+            }
+            
+            # Create overview worksheet with analysis summary
+            $OverviewData = @(
+                [PSCustomObject]@{ Metric = "Target OU"; Value = $TargetOU }
+                [PSCustomObject]@{ Metric = "Analysis Date"; Value = (Get-Date).ToString() }
+                [PSCustomObject]@{ Metric = "Total OUs Analyzed"; Value = $AllOUs.Count }
+                [PSCustomObject]@{ Metric = "OUs with Computers"; Value = $OUsWithComputers }
+                [PSCustomObject]@{ Metric = "Total Computers"; Value = $TotalComputers }
+                [PSCustomObject]@{ Metric = "Total GPO Links"; Value = $TotalGPOLinks }
+                [PSCustomObject]@{ Metric = "OUs with Uniform Windows Versions"; Value = $OUsWithSameVersion }
+                [PSCustomObject]@{ Metric = "OUs with Mixed Windows Versions"; Value = $OUsWithMixedVersions }
+            )
+            
+            $OverviewData | Export-Excel -Path $OutputFile -WorksheetName "Overview" -AutoSize -BoldTopRow -FreezeTopRow -MoveToStart
+            
+            Write-Host "Excel file created successfully: $OutputFile" -ForegroundColor Green
+            Write-Host "Worksheets created:" -ForegroundColor White
+            Write-Host "  - Overview (Analysis Summary)" -ForegroundColor Gray
+            Write-Host "  - OU Summary (Main Results)" -ForegroundColor Gray
+            Write-Host "  - Computer Details (All Computers)" -ForegroundColor Gray
+            Write-Host "  - GPO Links (All GPO Links)" -ForegroundColor Gray
+            Write-Host "  - Version Summary (OS Distribution)" -ForegroundColor Gray
+            
+        } else {
+            # Export to CSV files
+            Write-Host "Creating CSV files in: $OutputPath" -ForegroundColor Cyan
+            
+            $CSVBaseName = Join-Path $OutputPath $OutputFileName
+            
+            $Results | Export-Csv -Path "$CSVBaseName-OU-Summary.csv" -NoTypeInformation
+            Write-Host "Created: $CSVBaseName-OU-Summary.csv" -ForegroundColor Green
+            
+            if ($ComputerDetails.Count -gt 0) {
+                $ComputerDetails | Export-Csv -Path "$CSVBaseName-Computer-Details.csv" -NoTypeInformation
+                Write-Host "Created: $CSVBaseName-Computer-Details.csv" -ForegroundColor Green
+            }
+            
+            if ($GPODetails.Count -gt 0) {
+                $GPODetails | Export-Csv -Path "$CSVBaseName-GPO-Links.csv" -NoTypeInformation
+                Write-Host "Created: $CSVBaseName-GPO-Links.csv" -ForegroundColor Green
+            }
+            
+            if ($SummaryData.Count -gt 0) {
+                $SummaryData | Export-Csv -Path "$CSVBaseName-Version-Summary.csv" -NoTypeInformation
+                Write-Host "Created: $CSVBaseName-Version-Summary.csv" -ForegroundColor Green
+            }
+        }
+        
+    } catch {
+        Write-Error "Failed to export results: $($_.Exception.Message)"
+    }
+    }
+    
+    # Store results in global variable for further processing
+    $Global:OUAnalysisResults = $Results
+    
+    Write-Host "`nResults stored in `$Global:OUAnalysisResults variable" -ForegroundColor Yellow
+    Write-Host "Spreadsheet export complete!" -ForegroundColor Green
+    Write-Host "Ready for additional steps..." -ForegroundColor Green
+
+} catch {
+    Write-Error "Script execution failed: $($_.Exception.Message)"
+    Write-Error "Stack Trace: $($_.ScriptStackTrace)"
+}
+
+# Usage examples (commented out)
+<#
+# Basic usage:
+# .\Script.ps1 -TargetOU "OU=Workstations,DC=contoso,DC=com"
+
+# With custom output location:
+# .\Script.ps1 -TargetOU "OU=Workstations,DC=contoso,DC=com" -OutputPath "C:\Reports" -OutputFileName "WorkstationAnalysis"
+
+# Install ImportExcel module for better Excel output:
+# Install-Module ImportExcel -Scope CurrentUser
+#>
